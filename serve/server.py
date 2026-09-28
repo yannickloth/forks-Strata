@@ -15,6 +15,12 @@ An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
 `StrataEngine` keeps one `strata --serve` process resident (weights, expert arena and VRAM tier load once) and
 talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes every API path testable without a GPU.
+
+Lifecycle: the engine process is optional.  `--no-preload` serves with no engine at all; the first request starts
+it, and `--idle-unload SECONDS` (or `"idle_unload_s"` in the run config) frees its RAM and VRAM again after that
+much idle time.  `POST /api/inference/load`, `POST /api/inference/unload`, `GET /api/inference/status` and
+`GET /api/inference/load-progress` expose the same contract as Unsloth Studio's inference routes, so one client can
+drive either server.  `load`/`unload` bodies are padded to survive a proxy that times slow teardowns out.
 """
 from __future__ import annotations
 
@@ -137,17 +143,12 @@ class StrataEngine:
     """
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None):
+                 env: dict | None = None, preload: bool = True):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         self.log_path = log
-        self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
-        loading = threading.Event()                     # set once READY: the narrator below stops
-        if log:
-            threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
-                             daemon=True).start()
-        self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
-        self.max_context = 0
+        self.unloaded = not preload                     # lifecycle: True while no engine process is running
+        self.lines: queue.Queue = queue.Queue()
+        self.max_context = self._context_from_args(args)
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
@@ -156,6 +157,17 @@ class StrataEngine:
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
             self.info["version"] = None
+        if not preload:                  # --no-preload: no process yet; the first request (or /api/inference/load)
+            self.proc = None             # starts it through restart(), which re-runs this __init__ with it
+            self.ended = True
+            return
+        self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
+        loading = threading.Event()                     # set once READY: the narrator below stops
+        if log:
+            threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
+                             daemon=True).start()
+        self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
         for line in self.proc.stdout:
             if line.startswith("INFO "):
                 for kv in line.split()[1:]:
@@ -169,8 +181,8 @@ class StrataEngine:
         loading.set()
         if self.max_context <= 0:
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
+        self.unloaded = False                            # lifecycle: a process is running
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
-        self.lines: queue.Queue = queue.Queue()
         threading.Thread(target=self._pump, daemon=True).start()
 
     def _pump(self):
@@ -178,6 +190,15 @@ class StrataEngine:
             self.lines.put(line)
         self.ended = True                               # its output closed: it is gone, even before the OS says so
         self.lines.put(None)
+
+    @staticmethod
+    def _context_from_args(args: list) -> int:
+        """--max-context N from the run config: the context is known without starting the engine, so
+        --no-preload still answers /health and the request-size check before the first request."""
+        try:
+            return int(args[args.index("--max-context") + 1])
+        except (ValueError, IndexError, TypeError):
+            return 0
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
@@ -198,7 +219,7 @@ class StrataEngine:
                 "smaller model (Q2_0 / IQ2_XS).")
 
     def alive(self) -> bool:
-        return not getattr(self, "ended", False) and self.proc.poll() is None
+        return self.proc is not None and not getattr(self, "ended", False) and self.proc.poll() is None
 
     def exit_code(self):
         try:
@@ -207,15 +228,18 @@ class StrataEngine:
             return None
 
     def restart(self):
-        """Start the engine again (the same command) after it died; the new process has its own line queue."""
-        try:
-            self.proc.kill()
-        except OSError:
-            pass
+        """Start the engine again (the same command) after it died, or after a lifecycle unload; the new process
+        has its own line queue.  An engine created with preload=False has no process yet, so the kill is skipped."""
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
         info = dict(self.info)
         self.ended = False
         self.__init__(*self.spawn)
         self.info = {**info, **self.info}
+        self.unloaded = False
 
     def _parse_done(self, line):
         f = line.split()
@@ -330,12 +354,20 @@ class StrataEngine:
                         break
 
     def close(self):
-        try:
-            self.proc.stdin.write("QUIT\n")
-            self.proc.stdin.flush()
-            self.proc.wait(timeout=10)
-        except Exception:
-            self.proc.kill()
+        """Stop the engine process (a lifecycle unload, or server shutdown): its RAM and VRAM go back at once.
+        Safe when it is already gone or was never started (preload=False)."""
+        if self.proc is not None:
+            try:
+                self.proc.stdin.write("QUIT\n")
+                self.proc.stdin.flush()
+                self.proc.wait(timeout=10)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except OSError:
+                    pass
+        self.ended = True
+        self.unloaded = True
 
 
 class Vision:
@@ -505,6 +537,9 @@ class Service:
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
                        "prompt_ms": 0.0, "decode_ms": 0.0}
         self.status_lock = threading.Lock()
+        self.loading = False                          # lifecycle: a load/restart is in flight (/api/inference/status)
+        self.last_activity = time.time()              # lifecycle: the idle-unload watchdog's clock
+        self.idle_unload_s = 0                        # 0 = never unload (start_idle_watchdog sets it)
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
 
@@ -520,6 +555,58 @@ class Service:
             except OSError as e:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
+
+    # ---- lifecycle: the engine process is optional (mirrors Unsloth Studio's /api/inference contract) ---------
+    def engine_state(self) -> str:
+        """'loading' | 'loaded' | 'unloaded' - what /api/inference/status and /health report."""
+        if self.loading:
+            return "loading"
+        return "loaded" if self.engine.alive() else "unloaded"
+
+    def unload_engine(self) -> dict:
+        """Free the engine's RAM and VRAM (POST /api/inference/unload).  Waits for a request in flight: the FIFO
+        serializes them, so an unload never cuts a streamed answer.  Blocking (a large teardown takes seconds)."""
+        with self.fifo:
+            if self.engine.alive():
+                self.engine.close()
+            self.last_activity = time.time()
+        return {"status": "unloaded", "model": self.model}
+
+    def load_engine(self) -> dict:
+        """Start the engine again (POST /api/inference/load).  Blocking: the weights and the expert arena load in a
+        minute or two - the route's body is padded for exactly this reason."""
+        with self.fifo:
+            if not self.engine.alive():
+                self.loading = True
+                try:
+                    self.engine.restart()
+                finally:
+                    self.loading = False
+            self.last_activity = time.time()
+        return {"status": "loaded", "model": self.model}
+
+    def start_idle_watchdog(self, seconds: int) -> None:
+        """Unload the engine after `seconds` without a request (0 = never).  The workstation case: the 125B holds
+        ~55 GB of RAM and most of a 12 GB card, and another program (or game) may want them without a manual step."""
+        self.idle_unload_s = max(0, int(seconds or 0))
+        if self.idle_unload_s == 0:
+            return
+
+        def loop():
+            while True:
+                time.sleep(min(15, self.idle_unload_s))
+                try:
+                    if not self.engine.alive() or self.loading or self.fifo.locked():
+                        self.last_activity = time.time()          # busy or already unloaded: not idle time
+                        continue
+                    if time.time() - self.last_activity >= self.idle_unload_s:
+                        print(f"[strata] no request for {self.idle_unload_s} s: unloading the engine ...", flush=True)
+                        self.unload_engine()
+                        print("[strata] engine unloaded (the next request starts it again)", flush=True)
+                except Exception as e:                            # the watchdog must never die
+                    print(f"[strata] idle unload failed: {e}", flush=True)
+
+        threading.Thread(target=loop, daemon=True, name="strata-idle-watchdog").start()
 
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
@@ -686,11 +773,27 @@ class Service:
                 with self.status_lock:
                     self.status["queued"] -= 1
                 if hasattr(self.engine, "alive") and not self.engine.alive():
-                    # issue #27: it died in an earlier request - start it again instead of failing every request
-                    code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
-                    print(f"[strata] the engine had stopped (exit code {code}); starting it again "
-                          "(a minute or two) ...", flush=True)
-                    self.engine.restart()
+                    # issue #27: it died in an earlier request - or a lifecycle unload closed it - start it again
+                    # instead of failing.  The start is a minute or two, so stream keep-alives while it runs: a cold
+                    # first request (Studio -> this server) must not hit the client's own timeout.
+                    if getattr(self.engine, "unloaded", False):
+                        print("[strata] starting the engine (a minute or two) ...", flush=True)
+                    else:
+                        code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
+                        print(f"[strata] the engine had stopped (exit code {code}); starting it again "
+                              "(a minute or two) ...", flush=True)
+                    self.loading = True
+                    starter = threading.Thread(target=self.engine.restart, daemon=True, name="strata-engine-load")
+                    starter.start()
+                    try:
+                        while starter.is_alive():
+                            yield "ping", None            # SSE keep-alive while the weights load
+                            starter.join(timeout=5)
+                    finally:
+                        self.loading = starter.is_alive()
+                    self.last_activity = time.time()
+                    if not self.engine.alive():
+                        raise EngineDied("the engine did not come back up (see its log)")
                     print("[strata] the engine is running again", flush=True)
                 with self.status_lock:
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
@@ -767,6 +870,7 @@ class Service:
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                 self.status["busy"] = False
+                self.last_activity = time.time()              # lifecycle: the idle-unload watchdog's clock
         for ev in parser.finish():
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n}
@@ -955,7 +1059,20 @@ def make_handler(svc: Service):
             pass
 
         def _json(self, code, obj):
-            body = json.dumps(obj, ensure_ascii=False).encode()
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _padded_json(self, code, obj, target=16384):
+            """A load/unload answer with its body padded, like Studio's `_tunnel_safe_json`: a proxy between the
+            client and this server (a tunnel, a gateway) may time out a body smaller than its buffer while the
+            teardown runs.  The JSON stays valid - a trailing run of spaces inside the object is ignored."""
+            body = json.dumps(obj).encode()
+            if len(body) < target:
+                body = body[:-1] + b" " * (target - len(body)) + b"}"
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -1025,7 +1142,8 @@ def make_handler(svc: Service):
                 self.wfile.write(body)
             elif path == "/health":
                 self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
-                                 "images": svc.vision is not None, "api_key": bool(svc.api_key)})
+                                 "images": svc.vision is not None, "api_key": bool(svc.api_key),
+                                 "engine": svc.engine_state()})
             elif path == "/status":
                 with svc.status_lock:
                     s = dict(svc.status)
@@ -1040,6 +1158,20 @@ def make_handler(svc: Service):
             elif path == "/v1/models":
                 if self._authorized():
                     self._json(200, {"object": "list", "data": [{"id": svc.model, "object": "model"}]})
+            elif path == "/api/inference/status":
+                # the fields of Studio's InferenceStatusResponse, plus the ones this engine knows
+                if self._authorized():
+                    state = svc.engine_state()
+                    self._json(200, {"active_model": svc.model if state == "loaded" else None,
+                                     "model_identifier": svc.model, "is_gguf": True, "is_local_model": True,
+                                     "gguf_variant": None, "status": state, "engine": state,
+                                     "max_context": svc.engine.max_context, "images": svc.vision is not None})
+            elif path == "/api/inference/load-progress":
+                # Studio's phases: "mmap" while the weights page in, "ready" once up, null when no load is running
+                if self._authorized():
+                    state = svc.engine_state()
+                    self._json(200, {"phase": {"loading": "mmap", "loaded": "ready"}.get(state),
+                                     "state": state, "model": svc.model})
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -1052,7 +1184,14 @@ def make_handler(svc: Service):
                 return
             try:
                 req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-                if path == "/v1/chat/completions":
+                if path == "/api/inference/load":
+                    # blocking, a minute or two: the body is padded so a proxy keeps reading (see _padded_json)
+                    self._padded_json(200, {**svc.load_engine(), "display_name": svc.model, "is_lora": False,
+                                            "is_gguf": True, "is_local_model": True, "inference": {},
+                                            "memory_warning": None, "max_context": svc.engine.max_context})
+                elif path == "/api/inference/unload":
+                    self._padded_json(200, svc.unload_engine())
+                elif path == "/v1/chat/completions":
                     self._openai(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
@@ -1320,6 +1459,12 @@ def main() -> int:
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request "
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
+    ap.add_argument("--no-preload", action="store_true",
+                    help="serve with no engine process: it starts on the first request (or POST "
+                         "/api/inference/load), so the machine can host other models without holding this one")
+    ap.add_argument("--idle-unload", type=int, default=None,
+                    help="unload the engine (free its RAM and VRAM) after this many idle seconds; 0 = never; "
+                         "also \"idle_unload_s\" in the config")
     ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
                     help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY")
     a = ap.parse_args()
@@ -1360,8 +1505,12 @@ def main() -> int:
             print("loading the vision encoder ...", flush=True)
             vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=env)
-        print("loading the model (the first start takes a minute or two) ...", flush=True)
-        engine = StrataEngine(cfg["exe"], cfg["args"], cwd=cfg.get("cwd"), log=cfg.get("log"), env=env)
+        if a.no_preload:
+            print("serving with no engine loaded (the first request starts it) ...", flush=True)
+        else:
+            print("loading the model (the first start takes a minute or two) ...", flush=True)
+        engine = StrataEngine(cfg["exe"], cfg["args"], cwd=cfg.get("cwd"), log=cfg.get("log"), env=env,
+                              preload=not a.no_preload)
         warn_tight_ram(engine.info.get("arena_mib"))
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script), None, {}
@@ -1373,6 +1522,9 @@ def main() -> int:
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
     svc.gpu_index = cfg.get("gpu") or 0                 # the Monitor reads the card the engine runs on (issue #51)
+    svc.start_idle_watchdog(a.idle_unload if a.idle_unload is not None else int(cfg.get("idle_unload_s") or 0))
+    if svc.idle_unload_s:
+        print(f"[strata] the engine unloads itself after {svc.idle_unload_s} s without a request", flush=True)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
